@@ -1,0 +1,5 @@
+Flask==3.0.0
+Flask-SocketIO==5.3.6
+eventlet==0.33.3
+Werkzeug==3.0.1
+psycopg2-binary==2.9.9
