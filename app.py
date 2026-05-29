@@ -1,7 +1,8 @@
-import sqlite3
 import os
 import time
 import json
+import psycopg2
+from contextlib import contextmanager
 from flask import Flask, render_template, render_template_string, request, redirect, url_for, session, flash, send_from_directory
 from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
@@ -15,11 +16,22 @@ app.config['UPLOAD_FOLDER'] = 'static/uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True) 
 
 # ==========================================
-# ⚙️ ADMIN CONFIGURATION
+# ⚙️ ADMIN CONFIGURATION & DATABASE URL
 # ==========================================
-ADMIN_USERNAME = "X13"      # <--- CHANGE THIS
-ADMIN_PASSWORD = "X13@1013" # <--- CHANGE THIS
+ADMIN_USERNAME = "X13"      
+ADMIN_PASSWORD = "X13@1013" 
 
+# Fetches the Supabase URL from Render Environment Variables
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+@contextmanager
+def get_db():
+    # Helper function to open and close Supabase connections safely
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 online_users = {}
 active_calls = {}
@@ -136,52 +148,40 @@ ADMIN_DASHBOARD_HTML = """
 # ---------------------------------------------
 
 def init_db():
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    if not DATABASE_URL: return
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, avatar TEXT DEFAULT '/static/WS.jpg', bio TEXT DEFAULT 'Available')''')
-        c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, recipient TEXT, message TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS custom_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, members TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS blocked_users (id INTEGER PRIMARY KEY AUTOINCREMENT, blocker TEXT, blocked TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS reels (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, video_url TEXT, caption TEXT, views INTEGER DEFAULT 0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS calls (id INTEGER PRIMARY KEY AUTOINCREMENT, caller TEXT, receiver TEXT, call_type TEXT, status TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS statuses (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, media_url TEXT, caption TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS friendships (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, receiver TEXT, status TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, reporter TEXT, reported_type TEXT, reported_target TEXT, reason TEXT, status TEXT DEFAULT 'pending', timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, avatar TEXT DEFAULT '/static/WS.jpg', bio TEXT DEFAULT 'Available')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, sender TEXT, recipient TEXT, message TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS custom_groups (id SERIAL PRIMARY KEY, name TEXT, members TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS blocked_users (id SERIAL PRIMARY KEY, blocker TEXT, blocked TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS reels (id SERIAL PRIMARY KEY, username TEXT, video_url TEXT, caption TEXT, views INTEGER DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS calls (id SERIAL PRIMARY KEY, caller TEXT, receiver TEXT, call_type TEXT, status TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS statuses (id SERIAL PRIMARY KEY, username TEXT, media_url TEXT, caption TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, sender TEXT, receiver TEXT, status TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS reports (id SERIAL PRIMARY KEY, reporter TEXT, reported_type TEXT, reported_target TEXT, reason TEXT, status TEXT DEFAULT 'pending', timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
 
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('reels_enabled', '0')")
+        c.execute("INSERT INTO settings (key, value) VALUES ('reels_enabled', '0') ON CONFLICT (key) DO NOTHING")
 
-        # Safely add new columns if they don't exist yet
-        try: c.execute("ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE calls ADD COLUMN is_read INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE statuses ADD COLUMN viewers TEXT DEFAULT ''")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE messages ADD COLUMN reactions TEXT DEFAULT '{}'")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE reels ADD COLUMN likes INTEGER DEFAULT 0")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE reels ADD COLUMN liked_by TEXT DEFAULT ''")
-        except sqlite3.OperationalError: pass
-        
-        # ADMIN COLUMNS
-        try: c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE users ADD COLUMN account_status TEXT DEFAULT 'active'")
-        except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE reports ADD COLUMN status TEXT DEFAULT 'pending'")
-        except sqlite3.OperationalError: pass
+        # Safely add columns for Postgres
+        c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE calls ADD COLUMN IF NOT EXISTS is_read INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE statuses ADD COLUMN IF NOT EXISTS viewers TEXT DEFAULT ''")
+        c.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions TEXT DEFAULT '{}'")
+        c.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS likes INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS liked_by TEXT DEFAULT ''")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'")
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status TEXT DEFAULT 'active'")
+        c.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending'")
 
-        # Ensure the configured Admin Account exists AND updates if you change the password in app.py
+        # Admin Account Check
         hashed_admin_pw = generate_password_hash(ADMIN_PASSWORD)
-        
         c.execute("SELECT * FROM users WHERE role='admin'")
         if not c.fetchone():
-            c.execute("INSERT INTO users (username, password, role) VALUES (?, ?, 'admin')", (ADMIN_USERNAME.lower(), hashed_admin_pw))
+            c.execute("INSERT INTO users (username, password, role) VALUES (%s, %s, 'admin')", (ADMIN_USERNAME.lower(), hashed_admin_pw))
         else:
-            c.execute("UPDATE users SET username=?, password=? WHERE role='admin'", (ADMIN_USERNAME.lower(), hashed_admin_pw))
-
+            c.execute("UPDATE users SET username=%s, password=%s WHERE role='admin'", (ADMIN_USERNAME.lower(), hashed_admin_pw))
         conn.commit()
 
 init_db()
@@ -192,7 +192,6 @@ def sw():
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    # NATIVE BACK-BUTTON SAFEGUARD: Auto-redirect if already logged in!
     if 'username' in session: 
         return redirect(url_for('index'))
 
@@ -201,29 +200,28 @@ def register():
         password = request.form['password']
         hashed_pw = generate_password_hash(password) 
         try:
-            with sqlite3.connect('chat.db', timeout=10) as conn:
+            with get_db() as conn:
                 c = conn.cursor()
-                c.execute("INSERT INTO users (username, password, avatar, bio) VALUES (?, ?, '/static/WS.jpg', 'Available')", (username, hashed_pw))
+                c.execute("INSERT INTO users (username, password, avatar, bio) VALUES (%s, %s, '/static/WS.jpg', 'Available')", (username, hashed_pw))
                 conn.commit()
             flash("Account created successfully! Please log in.")
             return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             flash("Username already exists! Try another.")
             return redirect(url_for('register'))
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    # NATIVE BACK-BUTTON SAFEGUARD: Auto-redirect if already logged in!
     if 'username' in session: 
         return redirect(url_for('index'))
 
     if request.method == 'POST':
         username = request.form['username'].strip().lower()
         password = request.form['password']
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("SELECT password, account_status, role FROM users WHERE username=?", (username,))
+            c.execute("SELECT password, account_status, role FROM users WHERE username=%s", (username,))
             user = c.fetchone()
         
         if user and check_password_hash(user[0], password):
@@ -231,11 +229,10 @@ def login():
                 flash("This account has been suspended by an Administrator.")
                 return redirect(url_for('login'))
             
-            # REACTIVATION LOGIC: Soft deleted accounts get restored automatically
             if user[1] == 'deleted':
-                with sqlite3.connect('chat.db', timeout=10) as conn:
+                with get_db() as conn:
                     c = conn.cursor()
-                    c.execute("UPDATE users SET account_status='active' WHERE username=?", (username,))
+                    c.execute("UPDATE users SET account_status='active' WHERE username=%s", (username,))
                     conn.commit()
                 flash("Welcome back! Your account has been successfully reactivated.")
                 
@@ -258,9 +255,9 @@ def index():
     if 'username' not in session: return redirect(url_for('login'))
     username = session['username']
     
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT avatar, bio, account_status, role FROM users WHERE username=?", (username,))
+        c.execute("SELECT avatar, bio, account_status, role FROM users WHERE username=%s", (username,))
         row = c.fetchone()
         
         if row and row[2] == 'frozen':
@@ -270,7 +267,6 @@ def index():
         bio = row[1] if row and row[1] else 'Available'
         role = row[3] if row and len(row) > 3 else 'user'
         
-        # Get Global Reels Setting
         c.execute("SELECT value FROM settings WHERE key='reels_enabled'")
         setting = c.fetchone()
         reels_enabled = True if setting and setting[0] == '1' else False
@@ -285,9 +281,9 @@ def admin_login():
     if request.method == 'POST':
         username = request.form['username'].strip().lower()
         password = request.form['password']
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("SELECT password, role FROM users WHERE username=?", (username,))
+            c.execute("SELECT password, role FROM users WHERE username=%s", (username,))
             user = c.fetchone()
         
         if user and check_password_hash(user[0], password) and user[1] == 'admin':
@@ -304,10 +300,10 @@ def admin_dashboard():
     if session.get('role') != 'admin':
         return redirect(url_for('admin_login'))
         
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT id, reporter, reported_type, reported_target, reason, timestamp FROM reports WHERE status='pending' ORDER BY id DESC")
-        reports = [{'id': r[0], 'reporter': r[1], 'reported_type': r[2], 'reported_target': r[3], 'reason': r[4], 'timestamp': r[5]} for r in c.fetchall()]
+        reports = [{'id': r[0], 'reporter': r[1], 'reported_type': r[2], 'reported_target': r[3], 'reason': r[4], 'timestamp': r[5].strftime('%Y-%m-%d %H:%M') if r[5] else ''} for r in c.fetchall()]
         
         c.execute("SELECT username FROM users WHERE account_status='frozen'")
         frozen_users = [r[0] for r in c.fetchall()]
@@ -326,33 +322,33 @@ def admin_action():
     target = request.form.get('target')
     report_id = request.form.get('report_id')
     
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         
         if action == 'freeze_user':
-            c.execute("UPDATE users SET account_status='frozen' WHERE username=?", (target,))
+            c.execute("UPDATE users SET account_status='frozen' WHERE username=%s", (target,))
             if target in online_users:
                 socketio.emit('force_logout', "Your account has been suspended by an Administrator.", room=online_users[target])
         
         elif action == 'unfreeze_user':
-            c.execute("UPDATE users SET account_status='active' WHERE username=?", (target,))
+            c.execute("UPDATE users SET account_status='active' WHERE username=%s", (target,))
             
         elif action == 'delete_user':
-            c.execute("UPDATE users SET account_status='deleted' WHERE username=?", (target,))
-            c.execute("DELETE FROM messages WHERE sender=? OR recipient=?", (target, target))
+            c.execute("UPDATE users SET account_status='deleted' WHERE username=%s", (target,))
+            c.execute("DELETE FROM messages WHERE sender=%s OR recipient=%s", (target, target))
             if target in online_users:
                 socketio.emit('force_logout', "Your account has been deleted by an Administrator.", room=online_users[target])
         
         elif action == 'delete_reel':
-            c.execute("DELETE FROM reels WHERE id=?", (target,))
+            c.execute("DELETE FROM reels WHERE id=%s", (target,))
             socketio.emit('reel_deleted', target, broadcast=True)
 
         elif action == 'toggle_reels':
-            c.execute("UPDATE settings SET value=? WHERE key='reels_enabled'", (target,))
+            c.execute("UPDATE settings SET value=%s WHERE key='reels_enabled'", (target,))
             socketio.emit('reels_state_changed', target == '1')
 
         if report_id:
-            c.execute("UPDATE reports SET status='resolved' WHERE id=?", (report_id,))
+            c.execute("UPDATE reports SET status='resolved' WHERE id=%s", (report_id,))
             
         conn.commit()
         
@@ -379,9 +375,9 @@ def block_user():
     blocker = session.get('username')
     blocked = request.form.get('target')
     if not blocker or not blocked: return "Error", 400
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO blocked_users (blocker, blocked) VALUES (?, ?)", (blocker, blocked))
+        c.execute("INSERT INTO blocked_users (blocker, blocked) VALUES (%s, %s)", (blocker, blocked))
         conn.commit()
     return "OK", 200
 
@@ -390,9 +386,9 @@ def unblock_user():
     blocker = session.get('username')
     blocked = request.form.get('target')
     if not blocker or not blocked: return "Error", 400
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM blocked_users WHERE blocker=? AND blocked=?", (blocker, blocked))
+        c.execute("DELETE FROM blocked_users WHERE blocker=%s AND blocked=%s", (blocker, blocked))
         conn.commit()
     return "OK", 200
 
@@ -403,38 +399,37 @@ def leave_group():
     if not username or not group_id_str: return "Error", 400
     
     group_id = group_id_str.replace("GROUP_", "")
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT members FROM custom_groups WHERE id=?", (group_id,))
+        c.execute("SELECT members FROM custom_groups WHERE id=%s", (group_id,))
         row = c.fetchone()
         if row:
             members = row[0].split(',')
             if username in members:
                 members.remove(username)
                 if len(members) > 0:
-                    c.execute("UPDATE custom_groups SET members=? WHERE id=?", (",".join(members), group_id))
+                    c.execute("UPDATE custom_groups SET members=%s WHERE id=%s", (",".join(members), group_id))
                 else:
-                    c.execute("DELETE FROM custom_groups WHERE id=?", (group_id,))
+                    c.execute("DELETE FROM custom_groups WHERE id=%s", (group_id,))
             conn.commit()
     return "OK", 200
 
 @socketio.on('register')
 def handle_register(username):
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT account_status FROM users WHERE username=?", (username,))
+        c.execute("SELECT account_status FROM users WHERE username=%s", (username,))
         row = c.fetchone()
         if row and row[0] == 'frozen':
             emit('force_logout', "Your account is frozen.", room=request.sid)
             return
 
     online_users[username] = request.sid
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT blocked FROM blocked_users WHERE blocker=?", (username,))
+        c.execute("SELECT blocked FROM blocked_users WHERE blocker=%s", (username,))
         blocked_by_me = [row[0] for row in c.fetchall()]
 
-        # ONLY FETCH ACTIVE USERS FOR THE CONTACT LIST
         c.execute("SELECT username FROM users WHERE account_status='active' AND role!='admin'")
         all_users = [row[0] for row in c.fetchall()]
 
@@ -448,10 +443,10 @@ def handle_register(username):
             if username in member_list:
                 my_groups.append({'id': f"GROUP_{g[0]}", 'name': g[1], 'members': member_list})
                 
-        c.execute("SELECT COUNT(*) FROM calls WHERE receiver=? AND status='Missed' AND is_read=0", (username,))
+        c.execute("SELECT COUNT(*) FROM calls WHERE receiver=%s AND status='Missed' AND is_read=0", (username,))
         unread_calls = c.fetchone()[0]
 
-        c.execute("SELECT sender, receiver, status FROM friendships WHERE sender=? OR receiver=?", (username, username))
+        c.execute("SELECT sender, receiver, status FROM friendships WHERE sender=%s OR receiver=%s", (username, username))
         friendships = [{'sender': row[0], 'receiver': row[1], 'status': row[2]} for row in c.fetchall()]
 
     emit('update_users', {'contacts': all_users, 'online': list(online_users.keys()), 'groups': my_groups, 'blocked': blocked_by_me, 'profiles': profiles}, broadcast=True)
@@ -459,14 +454,14 @@ def handle_register(username):
 
     group_ids = [g['id'] for g in my_groups]
     query = '''SELECT id, sender, recipient, message, is_read, reactions FROM messages 
-               WHERE (recipient = "" OR recipient IS NULL OR recipient = ? OR sender = ?)'''
+               WHERE (recipient = '' OR recipient IS NULL OR recipient = %s OR sender = %s)'''
     params = [username, username]
     if group_ids:
-        placeholders = ','.join(['?'] * len(group_ids))
+        placeholders = ','.join(['%s'] * len(group_ids))
         query += f" OR recipient IN ({placeholders})"
-        params.extend(group_ids)
+        params.extend([f"GROUP_{gid}" for gid in group_ids])
         
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute(query, params)
         history = [{'id': row[0], 'user': row[1], 'recipient': row[2] if row[2] else None, 'message': row[3], 'is_read': row[4], 'reactions': json.loads(row[5]) if row[5] else {}} for row in c.fetchall()]
@@ -480,9 +475,9 @@ def handle_add_reaction(data):
     reaction = data['reaction']
     username = data['username']
     
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT reactions FROM messages WHERE id=?", (msg_id,))
+        c.execute("SELECT reactions FROM messages WHERE id=%s", (msg_id,))
         row = c.fetchone()
         if row:
             try: reactions_dict = json.loads(row[0]) if row[0] else {}
@@ -493,7 +488,7 @@ def handle_add_reaction(data):
             else:
                 reactions_dict[username] = reaction
                 
-            c.execute("UPDATE messages SET reactions=? WHERE id=?", (json.dumps(reactions_dict), msg_id))
+            c.execute("UPDATE messages SET reactions=%s WHERE id=%s", (json.dumps(reactions_dict), msg_id))
             conn.commit()
             emit('reaction_updated', {'msg_id': msg_id, 'reactions': reactions_dict}, broadcast=True)
 
@@ -502,9 +497,9 @@ def handle_mark_read(data):
     sender = data.get('sender')
     recipient = data.get('recipient')
     if sender and recipient:
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("UPDATE messages SET is_read = 1 WHERE sender = ? AND recipient = ?", (sender, recipient))
+            c.execute("UPDATE messages SET is_read = 1 WHERE sender = %s AND recipient = %s", (sender, recipient))
             conn.commit()
         if sender in online_users:
             emit('messages_read', {'reader': recipient}, room=online_users[sender])
@@ -514,9 +509,9 @@ def handle_update_profile(data):
     username = data.get('username')
     avatar = data.get('avatar')
     bio = data.get('bio')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("UPDATE users SET avatar=?, bio=? WHERE username=?", (avatar, bio, username))
+        c.execute("UPDATE users SET avatar=%s, bio=%s WHERE username=%s", (avatar, bio, username))
         conn.commit()
     emit('profile_updated', {'username': username, 'avatar': avatar, 'bio': bio}, broadcast=True)
 
@@ -524,10 +519,10 @@ def handle_update_profile(data):
 def handle_create_group(data):
     name = data['name']
     members = ",".join(data['members'])
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO custom_groups (name, members) VALUES (?, ?)", (name, members))
-        group_id = c.lastrowid
+        c.execute("INSERT INTO custom_groups (name, members) VALUES (%s, %s) RETURNING id", (name, members))
+        group_id = c.fetchone()[0]
         conn.commit()
     
     group_data = {'id': f"GROUP_{group_id}", 'name': name, 'members': data['members']}
@@ -548,14 +543,14 @@ def handle_message(data):
     recipient = data.get('recipient') or "" 
     message = data.get('message')
 
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         if recipient and not recipient.startswith("GROUP_"):
-            c.execute("SELECT 1 FROM blocked_users WHERE blocker=? AND blocked=?", (recipient, sender))
+            c.execute("SELECT 1 FROM blocked_users WHERE blocker=%s AND blocked=%s", (recipient, sender))
             if c.fetchone(): return 
 
-        c.execute("INSERT INTO messages (sender, recipient, message, is_read, reactions) VALUES (?, ?, ?, 0, '{}')", (sender, recipient, message))
-        msg_id = c.lastrowid 
+        c.execute("INSERT INTO messages (sender, recipient, message, is_read, reactions) VALUES (%s, %s, %s, 0, '{}') RETURNING id", (sender, recipient, message))
+        msg_id = c.fetchone()[0]
         conn.commit()
         data['id'] = msg_id 
         data['is_read'] = 0
@@ -563,7 +558,7 @@ def handle_message(data):
 
         if recipient.startswith("GROUP_"):
             group_id = recipient.split("_")[1]
-            c.execute("SELECT members FROM custom_groups WHERE id=?", (group_id,))
+            c.execute("SELECT members FROM custom_groups WHERE id=%s", (group_id,))
             res = c.fetchone()
             if res:
                 members = res[0].split(',')
@@ -579,9 +574,9 @@ def handle_message(data):
 
 @socketio.on('delete_message')
 def handle_delete(msg_id):
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+        c.execute("DELETE FROM messages WHERE id=%s", (msg_id,))
         conn.commit()
     emit('message_deleted', msg_id, broadcast=True)
 
@@ -591,9 +586,9 @@ def handle_typing(data):
     recipient = data.get('recipient') or ""
     if recipient.startswith("GROUP_"):
         group_id = recipient.split("_")[1]
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("SELECT members FROM custom_groups WHERE id=?", (group_id,))
+            c.execute("SELECT members FROM custom_groups WHERE id=%s", (group_id,))
             res = c.fetchone()
             if res:
                 members = res[0].split(',')
@@ -611,40 +606,40 @@ def handle_publish_status(data):
     username = data.get('username')
     media_url = data.get('media_url')
     caption = data.get('caption')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO statuses (username, media_url, caption, viewers) VALUES (?, ?, ?, '')", (username, media_url, caption))
+        c.execute("INSERT INTO statuses (username, media_url, caption, viewers) VALUES (%s, %s, %s, '')", (username, media_url, caption))
         conn.commit()
     emit('status_updated', broadcast=True)
 
 @socketio.on('request_statuses')
 def handle_request_statuses():
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, username, media_url, caption, timestamp, viewers FROM statuses WHERE timestamp >= datetime('now', '-24 hours') ORDER BY timestamp ASC")
-        statuses = [{'id': row[0], 'username': row[1], 'media_url': row[2], 'caption': row[3], 'time': row[4], 'viewers': row[5]} for row in c.fetchall()]
+        c.execute("SELECT id, username, media_url, caption, timestamp, viewers FROM statuses WHERE timestamp >= NOW() - INTERVAL '24 HOURS' ORDER BY timestamp ASC")
+        statuses = [{'id': row[0], 'username': row[1], 'media_url': row[2], 'caption': row[3], 'time': row[4].strftime('%Y-%m-%d %H:%M:%S') if row[4] else '', 'viewers': row[5]} for row in c.fetchall()]
     emit('load_statuses', statuses, room=request.sid)
 
 @socketio.on('view_status')
 def handle_view_status(data):
     status_id = data.get('status_id')
     viewer = data.get('username')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT viewers FROM statuses WHERE id=?", (status_id,))
+        c.execute("SELECT viewers FROM statuses WHERE id=%s", (status_id,))
         row = c.fetchone()
         if row:
             viewers = row[0].split(',') if row[0] else []
             if viewer not in viewers:
                 viewers.append(viewer)
-                c.execute("UPDATE statuses SET viewers=? WHERE id=?", (",".join(viewers), status_id))
+                c.execute("UPDATE statuses SET viewers=%s WHERE id=%s", (",".join(viewers), status_id))
                 conn.commit()
 
 @socketio.on('delete_status')
 def handle_delete_status(status_id):
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM statuses WHERE id=?", (status_id,))
+        c.execute("DELETE FROM statuses WHERE id=%s", (status_id,))
         conn.commit()
     emit('status_updated', broadcast=True)
 
@@ -652,9 +647,9 @@ def handle_delete_status(status_id):
 def handle_edit_status(data):
     status_id = data.get('status_id')
     new_caption = data.get('caption')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("UPDATE statuses SET caption=? WHERE id=?", (new_caption, status_id))
+        c.execute("UPDATE statuses SET caption=%s WHERE id=%s", (new_caption, status_id))
         conn.commit()
     emit('status_updated', broadcast=True)
 
@@ -666,16 +661,16 @@ def handle_publish_reel(data):
     username = data.get('username')
     video_url = data.get('video_url')
     caption = data.get('caption')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO reels (username, video_url, caption, views, likes, liked_by) VALUES (?, ?, ?, 0, 0, '')", (username, video_url, caption))
-        reel_id = c.lastrowid
+        c.execute("INSERT INTO reels (username, video_url, caption, views, likes, liked_by) VALUES (%s, %s, %s, 0, 0, '') RETURNING id", (username, video_url, caption))
+        reel_id = c.fetchone()[0]
         conn.commit()
     emit('new_reel', {'id': reel_id, 'username': username, 'video_url': video_url, 'caption': caption, 'views': 0, 'likes': 0, 'liked_by': ''}, broadcast=True)
 
 @socketio.on('request_reels')
 def handle_request_reels():
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT id, username, video_url, caption, views, likes, liked_by FROM reels ORDER BY id DESC")
         reels = [{'id': row[0], 'username': row[1], 'video_url': row[2], 'caption': row[3], 'views': row[4], 'likes': row[5], 'liked_by': row[6]} for row in c.fetchall()]
@@ -683,18 +678,18 @@ def handle_request_reels():
 
 @socketio.on('increment_view')
 def handle_increment_view(reel_id):
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("UPDATE reels SET views = views + 1 WHERE id = ?", (reel_id,))
+        c.execute("UPDATE reels SET views = views + 1 WHERE id = %s", (reel_id,))
         conn.commit()
 
 @socketio.on('like_reel')
 def handle_like_reel(data):
     reel_id = data.get('id')
     username = data.get('username')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT liked_by FROM reels WHERE id=?", (reel_id,))
+        c.execute("SELECT liked_by FROM reels WHERE id=%s", (reel_id,))
         row = c.fetchone()
         if row:
             liked_by = row[0].split(',') if row[0] else []
@@ -705,15 +700,15 @@ def handle_like_reel(data):
             
             new_liked_by = ",".join(liked_by)
             new_likes = len(liked_by)
-            c.execute("UPDATE reels SET likes=?, liked_by=? WHERE id=?", (new_likes, new_liked_by, reel_id))
+            c.execute("UPDATE reels SET likes=%s, liked_by=%s WHERE id=%s", (new_likes, new_liked_by, reel_id))
             conn.commit()
             emit('reel_liked', {'id': reel_id, 'likes': new_likes, 'liked_by': new_liked_by}, broadcast=True)
 
 @socketio.on('request_my_reels')
 def handle_request_my_reels(username):
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, video_url, caption, views, likes, liked_by FROM reels WHERE username = ? ORDER BY id DESC", (username,))
+        c.execute("SELECT id, video_url, caption, views, likes, liked_by FROM reels WHERE username = %s ORDER BY id DESC", (username,))
         my_reels = [{'id': row[0], 'video_url': row[1], 'caption': row[2], 'views': row[3], 'likes': row[4], 'liked_by': row[5]} for row in c.fetchall()]
     emit('load_my_reels', my_reels, room=request.sid)
 
@@ -721,9 +716,9 @@ def handle_request_my_reels(username):
 def handle_delete_reel(data):
     reel_id = data.get('id')
     username = data.get('username')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM reels WHERE id=? AND username=?", (reel_id, username))
+        c.execute("DELETE FROM reels WHERE id=%s AND username=%s", (reel_id, username))
         conn.commit()
     emit('reel_deleted', reel_id, broadcast=True)
     handle_request_my_reels(username)
@@ -738,9 +733,9 @@ def handle_report_item(data):
     reported_target = data.get('target')
     reason = data.get('reason')
     
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO reports (reporter, reported_type, reported_target, reason) VALUES (?, ?, ?, ?)", 
+        c.execute("INSERT INTO reports (reporter, reported_type, reported_target, reason) VALUES (%s, %s, %s, %s)", 
                   (reporter, reported_type, str(reported_target), reason))
         conn.commit()
 
@@ -749,13 +744,13 @@ def handle_report_item(data):
 # ==========================================
 @socketio.on('request_call_history')
 def handle_call_history(username):
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("UPDATE calls SET is_read = 1 WHERE receiver = ? AND status = 'Missed'", (username,))
+        c.execute("UPDATE calls SET is_read = 1 WHERE receiver = %s AND status = 'Missed'", (username,))
         conn.commit()
         
-        c.execute("SELECT caller, receiver, call_type, status, timestamp FROM calls WHERE caller = ? OR receiver = ? ORDER BY id DESC LIMIT 50", (username, username))
-        calls = [{'caller': row[0], 'receiver': row[1], 'type': row[2], 'status': row[3], 'time': row[4]} for row in c.fetchall()]
+        c.execute("SELECT caller, receiver, call_type, status, timestamp FROM calls WHERE caller = %s OR receiver = %s ORDER BY id DESC LIMIT 50", (username, username))
+        calls = [{'caller': row[0], 'receiver': row[1], 'type': row[2], 'status': row[3], 'time': row[4].strftime('%Y-%m-%d %H:%M:%S') if row[4] else ''} for row in c.fetchall()]
     emit('load_call_history', calls, room=request.sid)
     emit('unread_calls_count', 0, room=request.sid) 
 
@@ -765,10 +760,10 @@ def handle_offer(data):
     receiver = data['recipient']
     call_type = 'Video' if data.get('isVideo') else 'Audio'
     
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO calls (caller, receiver, call_type, status) VALUES (?, ?, ?, 'Missed')", (caller, receiver, call_type))
-        call_id = c.lastrowid
+        c.execute("INSERT INTO calls (caller, receiver, call_type, status) VALUES (%s, %s, %s, 'Missed') RETURNING id", (caller, receiver, call_type))
+        call_id = c.fetchone()[0]
         conn.commit()
     
     active_calls[caller] = call_id
@@ -785,9 +780,9 @@ def handle_answer(data):
         call_id = active_calls[caller]
 
     if call_id:
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("UPDATE calls SET status = 'Answered', is_read = 1 WHERE id = ?", (call_id,))
+            c.execute("UPDATE calls SET status = 'Answered', is_read = 1 WHERE id = %s", (call_id,))
             conn.commit()
 
     if caller in online_users: 
@@ -801,9 +796,9 @@ def handle_reject_call(data):
         call_id = active_calls[caller]
         
     if call_id:
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("UPDATE calls SET status = 'Declined', is_read = 1 WHERE id = ?", (call_id,))
+            c.execute("UPDATE calls SET status = 'Declined', is_read = 1 WHERE id = %s", (call_id,))
             conn.commit()
             
     if caller in online_users: 
@@ -819,9 +814,9 @@ def handle_end_call(data):
     if data['recipient'] in online_users: 
         emit('call_ended', data, room=online_users[data['recipient']])
         
-        with sqlite3.connect('chat.db', timeout=10) as conn:
+        with get_db() as conn:
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM calls WHERE receiver=? AND status='Missed' AND is_read=0", (data['recipient'],))
+            c.execute("SELECT COUNT(*) FROM calls WHERE receiver=%s AND status='Missed' AND is_read=0", (data['recipient'],))
             unread = c.fetchone()[0]
         emit('unread_calls_count', unread, room=online_users[data['recipient']])
 
@@ -832,11 +827,11 @@ def handle_end_call(data):
 def handle_send_friend_request(data):
     sender = data.get('sender')
     receiver = data.get('receiver')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT 1 FROM friendships WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?)", (sender, receiver, receiver, sender))
+        c.execute("SELECT 1 FROM friendships WHERE (sender=%s AND receiver=%s) OR (sender=%s AND receiver=%s)", (sender, receiver, receiver, sender))
         if not c.fetchone():
-            c.execute("INSERT INTO friendships (sender, receiver, status) VALUES (?, ?, 'pending')", (sender, receiver))
+            c.execute("INSERT INTO friendships (sender, receiver, status) VALUES (%s, %s, 'pending')", (sender, receiver))
             conn.commit()
     
     update = {'sender': sender, 'receiver': receiver, 'status': 'pending'}
@@ -847,9 +842,9 @@ def handle_send_friend_request(data):
 def handle_accept_friend_request(data):
     sender = data.get('sender')
     receiver = data.get('receiver')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("UPDATE friendships SET status='accepted' WHERE sender=? AND receiver=?", (sender, receiver))
+        c.execute("UPDATE friendships SET status='accepted' WHERE sender=%s AND receiver=%s", (sender, receiver))
         conn.commit()
         
     update = {'sender': sender, 'receiver': receiver, 'status': 'accepted'}
@@ -860,9 +855,9 @@ def handle_accept_friend_request(data):
 def handle_reject_friend_request(data):
     sender = data.get('sender')
     receiver = data.get('receiver')
-    with sqlite3.connect('chat.db', timeout=10) as conn:
+    with get_db() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM friendships WHERE sender=? AND receiver=?", (sender, receiver))
+        c.execute("DELETE FROM friendships WHERE sender=%s AND receiver=%s", (sender, receiver))
         conn.commit()
         
     update = {'sender': sender, 'receiver': receiver, 'status': 'rejected'}
